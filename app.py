@@ -39,8 +39,8 @@ def clean_number_series(series):
   return pd.to_numeric(s_clean, errors="coerce")
 
 
-def load_excel_smart(file_bytes, kw_sheet_list=None):
-  """智慧讀取 Excel：自動跳過備註列並找到真實標題與代碼欄"""
+def load_excel_smart(file_bytes, kw_keywords=None):
+  """智慧讀取 Excel：自動跳過備註列並透過模糊關鍵字尋找正確頁籤"""
   if not file_bytes:
     return pd.DataFrame()
 
@@ -57,13 +57,13 @@ def load_excel_smart(file_bytes, kw_sheet_list=None):
   buffer.seek(0)
   xls = pd.ExcelFile(buffer)
 
+  # 模糊頁籤搜尋（不受 . 或 、 影響）
   target_sheet = xls.sheet_names[0]
-  if kw_sheet_list:
-    for kw in kw_sheet_list:
-      for s in xls.sheet_names:
-        if kw in s:
-          target_sheet = s
-          break
+  if kw_keywords:
+    for s in xls.sheet_names:
+      if any(kw in s for kw in kw_keywords):
+        target_sheet = s
+        break
 
   buffer.seek(0)
   raw_df = pd.read_excel(buffer, sheet_name=target_sheet, header=None)
@@ -85,20 +85,22 @@ def load_excel_smart(file_bytes, kw_sheet_list=None):
       continue
 
     score = sum(
-        1
-        for kw in [
-            "股票",
-            "代碼",
-            "代號",
-            "名稱",
-            "收盤",
-            "均線",
-            "營收",
-            "距離",
-            "主力",
-        ]
-        if any(kw in c for c in cells)
-    )
+      1
+      for kw in [
+          "股票",
+          "代碼",
+          "代號",
+          "名稱",
+          "收盤",
+          "均線",
+          "營收",
+          "毛利",
+          "EPS",
+          "距離",
+          "主力",
+      ]
+      if any(kw in c for c in cells)
+  )
     if score > max_score and len(cells) >= 3:
       max_score = score
       best_idx = i
@@ -151,7 +153,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
     file_dict = {f.name: f for f in uploaded_files}
 
     try:
-      with st.spinner("依據指定欄位與 AND 邏輯進行資料篩選中..."):
+      with st.spinner("依據指定欄位進行資料讀取與精準篩選中..."):
 
         f_fund, f_tech, f_high, f_chip = None, None, None, None
         for name, f in file_dict.items():
@@ -164,17 +166,9 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
           elif "型態" in name or "細部" in name:
             f_chip = f
 
-        # A. 載入各表
+        # A. 載入各表（對準模糊關鍵字）
         df_fund = (
-            load_excel_smart(
-                f_fund,
-                [
-                    "營收年成長.毛利率及2季EPS",
-                    "營收年成長",
-                    "毛利率及",
-                    "EPS",
-                ],
-            )
+            load_excel_smart(f_fund, ["營收", "毛利", "EPS"])
             if f_fund
             else pd.DataFrame()
         )
@@ -233,44 +227,63 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                 df_chip_sub, on="標準股票代碼", how="left"
             )
 
-        # C. 條件篩選 (邏輯 AND 組合)
+        # C. 條件篩選 (嚴格 AND 邏輯)
         filtered_df = merged_df.copy()
 
-        # 1. 基本面： (營收年成長 > 0) AND (最新期毛利率 > 前一期) AND (EPS > 0)
+        # 1. 基本面篩選
         if use_fundamental:
           rev_col = next(
               (
                   c
                   for c in filtered_df.columns
-                  if "營收年成長" in c or "營收年增" in c
+                  if "營收年成長" in c or "營收年增" in c or "營收" in c
               ),
               None,
           )
           eps_col = next(
-              (c for c in filtered_df.columns if "EPS" in c or "每股盈餘" in c),
-              None,
-          )
-
-          gm_cols = [c for c in filtered_df.columns if "毛利率" in c]
-          gm_curr_col = next((c for c in gm_cols if "前" not in c), None)
-          gm_prev_col = next(
               (
                   c
-                  for c in gm_cols
-                  if "前一季" in c or "前季" in c or "前1期" in c or "前期" in c
+                  for c in filtered_df.columns
+                  if "EPS" in c.upper() or "每股盈餘" in c
               ),
               None,
           )
 
+          gm_cols = [c for c in filtered_df.columns if "毛利率" in c]
+          gm_prev_col = next(
+              (
+                  c
+                  for c in gm_cols
+                  if any(k in c for k in ["前", "上", "舊", "前期"])
+              ),
+              None,
+          )
+          gm_curr_col = next((c for c in gm_cols if c != gm_prev_col), None)
+
+          # 欄位缺乏檢查：若找不到欄位，發出警告訊息
+          missing_cols = []
+          if not rev_col:
+            missing_cols.append("營收年成長")
+          if not eps_col:
+            missing_cols.append("EPS")
+          if not (gm_curr_col and gm_prev_col):
+            missing_cols.append("毛利率(最新/前期)")
+
+          if missing_cols:
+            st.warning(
+                f"⚠️ 基本面報表中找不到以下欄位：{', '.join(missing_cols)}，請確認上傳檔案是否包含對應頁籤。"
+            )
+
+          # 建立精準布林遮罩 (欄位存在才過濾，不存在則標記為 False 避免預設放行)
           cond_rev = (
               (clean_number_series(filtered_df[rev_col]) > 0)
               if rev_col
-              else pd.Series(True, index=filtered_df.index)
+              else pd.Series(False, index=filtered_df.index)
           )
           cond_eps = (
               (clean_number_series(filtered_df[eps_col]) > 0)
               if eps_col
-              else pd.Series(True, index=filtered_df.index)
+              else pd.Series(False, index=filtered_df.index)
           )
 
           if gm_curr_col and gm_prev_col:
@@ -278,13 +291,13 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
             gm_prev = clean_number_series(filtered_df[gm_prev_col])
             cond_gm = (gm_curr > gm_prev) & gm_curr.notna() & gm_prev.notna()
           else:
-            cond_gm = pd.Series(True, index=filtered_df.index)
+            cond_gm = pd.Series(False, index=filtered_df.index)
 
-          # 使用 & 將三個條件強行複合
+          # 強制 AND 複合過濾
           fundamental_mask = cond_rev & cond_gm & cond_eps
           filtered_df = filtered_df[fundamental_mask]
 
-        # 2. 安全位階：收盤價 vs 24日均線 (-5% ~ +15%)
+        # 2. 安全位階
         if use_ma24_bias:
           close_col = next(
               (c for c in filtered_df.columns if "收盤價" in c), None
@@ -305,7 +318,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
             )
             filtered_df = filtered_df[valid_mask]
 
-        # 3. 關鍵突破位階 (-3% ~ +3%)
+        # 3. 關鍵突破位階
         if use_month_high_dist and "與上個月高點距離" in filtered_df.columns:
           dist_num = clean_number_series(filtered_df["與上個月高點距離"])
           if dist_num.abs().max() > 1:
@@ -315,7 +328,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                 (dist_num >= -0.03) & (dist_num <= 0.03)
             ]
 
-        # 4. 籌碼面 (主力買超大於0天數 > 0)
+        # 4. 籌碼面
         if use_main_buy and "主力買超大於0天數" in filtered_df.columns:
           buy_num = clean_number_series(filtered_df["主力買超大於0天數"]).fillna(
               0
