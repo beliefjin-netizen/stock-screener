@@ -16,7 +16,7 @@ uploaded_files = st.file_uploader(
 
 
 def load_excel_smart(file_bytes, sheet_name=0):
-    """清理 CMoney autofilter 錯誤並自動動態定位『股票代號』所在的標題列"""
+    """清理 CMoney autofilter 錯誤並自動定位『股票代號』所在的標題列"""
     buffer = io.BytesIO()
     with zipfile.ZipFile(file_bytes, "r") as zin:
         with zipfile.ZipFile(buffer, "w") as zout:
@@ -30,20 +30,22 @@ def load_excel_smart(file_bytes, sheet_name=0):
                 zout.writestr(item, data)
     buffer.seek(0)
 
-    # 讀取完整 raw data，不指定 header
+    # 讀取完整 raw data
     raw_df = pd.read_excel(buffer, sheet_name=sheet_name, header=None)
 
-    # 動態尋找包含「股票代號」、「股票代碼」或「代號」所在的列作為標題列
+    # 修正點：確保所有元素轉為 str 後再進行串接搜尋標題列
     header_idx = 0
     for i, row in raw_df.iloc[:10].iterrows():
-        row_str = row.astype(str).values
+        row_str_joined = "".join(
+            [str(val) for val in row.values if pd.notna(val)]
+        )
         if any(
-            k in "".join(row_str) for k in ["股票代號", "股票代碼", "代號"]
+            k in row_str_joined for k in ["股票代號", "股票代碼", "代號"]
         ):
             header_idx = i
             break
 
-    # 重新解析資料
+    # 重新指定正確標題列解析
     buffer.seek(0)
     df = pd.read_excel(buffer, sheet_name=sheet_name, header=header_idx)
 
@@ -64,7 +66,7 @@ def load_excel_smart(file_bytes, sheet_name=0):
             .str.replace(".0", "", regex=False)
             .str.strip()
         )
-        # 過濾掉非股票代碼的雜訊列
+        # 過濾掉非股票代碼的雜訊列（只保留4~6位數字）
         df = df[df["標準股票代碼"].str.contains(r"^\d{4,6}$", na=False)]
 
     return df
@@ -146,7 +148,7 @@ if st.button("🚀 開始執行篩選", type="primary"):
                 merged_df = df_base.copy()
 
                 # 合併 24日均線
-                if df_ma is not None:
+                if df_ma is not None and "標準股票代碼" in df_ma.columns:
                     ma_cols = [
                         c
                         for c in df_ma.columns
@@ -161,7 +163,7 @@ if st.button("🚀 開始執行篩選", type="primary"):
                         )
 
                 # 合併主力買超天數
-                if df_detail is not None:
+                if df_detail is not None and "標準股票代碼" in df_detail.columns:
                     buy_cols = [
                         c for c in df_detail.columns if "主力買超" in c
                     ]
@@ -174,7 +176,7 @@ if st.button("🚀 開始執行篩選", type="primary"):
                         )
 
                 # 合併上月高點距離
-                if df_high is not None:
+                if df_high is not None and "標準股票代碼" in df_high.columns:
                     dist_cols = [
                         c
                         for c in df_high.columns
@@ -233,7 +235,7 @@ if st.button("🚀 開始執行篩選", type="primary"):
                     f"🎉 篩選完成！共找到 {len(filtered_df)} 檔符合條件的股票"
                 )
 
-                # 整理顯示欄位 (保留常用重要欄位)
+                # 整理顯示欄位
                 display_cols = [
                     c
                     for c in filtered_df.columns
