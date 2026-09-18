@@ -15,8 +15,30 @@ uploaded_files = st.file_uploader(
 )
 
 
-def load_excel_smart(file_bytes, sheet_name=0):
-    """清理 CMoney autofilter 錯誤並自動定位『股票代號』所在的標題列"""
+def clean_code(series):
+    """統一將股票代號清洗為標準字串格式（去除 .0 並補零）"""
+    return (
+        series.astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+        .str.zfill(4)
+    )
+
+
+def get_sheet_smart(buffer_bytes, target_kw):
+    """根據關鍵字動態尋找工作表名稱，若找不到則傳回第一個工作表索引 0"""
+    try:
+        xls = pd.ExcelFile(buffer_bytes)
+        for s in xls.sheet_names:
+            if target_kw in s:
+                return s
+    except Exception:
+        pass
+    return 0
+
+
+def load_excel_smart(file_bytes, kw_sheet=""):
+    """清理 CMoney autofilter 錯誤、定位正確標題列並抽取資料"""
     buffer = io.BytesIO()
     with zipfile.ZipFile(file_bytes, "r") as zin:
         with zipfile.ZipFile(buffer, "w") as zout:
@@ -30,40 +52,42 @@ def load_excel_smart(file_bytes, sheet_name=0):
                 zout.writestr(item, data)
     buffer.seek(0)
 
-    # 讀取完整 raw data
-    raw_df = pd.read_excel(buffer, sheet_name=sheet_name, header=None)
+    # 選擇正確的 Sheet
+    selected_sheet = get_sheet_smart(buffer, kw_sheet) if kw_sheet else 0
 
-    # 定位標題列
-    header_idx = 0
-    for i, row in raw_df.iloc[:10].iterrows():
-        row_str_joined = "".join(
-            [str(val) for val in row.values if pd.notna(val)]
-        )
-        if any(
-            k in row_str_joined for k in ["股票代號", "股票代碼", "代號"]
-        ):
-            header_idx = i
-            break
-
-    # 解析標題與清理
+    # 讀取 Raw Data 並精準定位標題列
     buffer.seek(0)
-    df = pd.read_excel(buffer, sheet_name=sheet_name, header=header_idx)
+    raw_df = pd.read_excel(buffer, sheet_name=selected_sheet, header=None)
+
+    header_idx = 0
+    for i, row in raw_df.iloc[:20].iterrows():
+        # 排除全空或只有 1 個值的備註說明列
+        valid_vals = [str(v).strip() for v in row.values if pd.notna(v)]
+        if len(valid_vals) > 1:
+            row_str = " ".join(valid_vals)
+            if any(
+                k in row_str
+                for k in ["股票代號", "股票代碼", "代號", "股票名稱"]
+            ):
+                header_idx = i
+                break
+
+    # 重新解析標題
+    buffer.seek(0)
+    df = pd.read_excel(buffer, sheet_name=selected_sheet, header=header_idx)
+    df = df.dropna(how="all").reset_index(drop=True)
+
     df.columns = [
         str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
         for i, c in enumerate(df.columns)
     ]
 
-    # 格式化股票代碼
+    # 清洗股票代碼
     code_col = next(
         (c for c in df.columns if "股票代號" in c or "股票代碼" in c), None
     )
     if code_col:
-        df["標準股票代碼"] = (
-            df[code_col]
-            .astype(str)
-            .str.replace(".0", "", regex=False)
-            .str.strip()
-        )
+        df["標準股票代碼"] = clean_code(df[code_col])
         df = df[df["標準股票代碼"].str.contains(r"^\d{4,6}$", na=False)]
 
     return df
@@ -121,14 +145,12 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                     f_chip_center = list(file_dict.values())[0]
 
                 df_base = load_excel_smart(
-                    f_chip_center, sheet_name="個股圖表資料"
+                    f_chip_center, kw_sheet="個股圖表資料"
                 )
 
                 # 讀取 24MA 頁籤
                 try:
-                    df_ma = load_excel_smart(
-                        f_chip_center, sheet_name="均線"
-                    )
+                    df_ma = load_excel_smart(f_chip_center, kw_sheet="均線")
                 except Exception:
                     df_ma = None
 
@@ -142,7 +164,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                     None,
                 )
                 df_detail = (
-                    load_excel_smart(f_chip_detail, sheet_name="近5日")
+                    load_excel_smart(f_chip_detail, kw_sheet="近5日")
                     if f_chip_detail
                     else None
                 )
@@ -156,9 +178,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                     None,
                 )
                 df_high = (
-                    load_excel_smart(
-                        f_high, sheet_name="收盤價大於上個月高點"
-                    )
+                    load_excel_smart(f_high, kw_sheet="高點")
                     if f_high
                     else None
                 )
@@ -167,55 +187,67 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                 merged_df = df_base.copy()
 
                 # 合併 24MA 均線
-                if df_ma is not None and "標準股票代碼" in df_ma.columns:
+                if (
+                    df_ma is not None
+                    and "標準股票代碼" in df_ma.columns
+                    and not df_ma.empty
+                ):
                     ma_cols = [
                         c
                         for c in df_ma.columns
                         if "24" in c or "均線" in c or "MA" in c
                     ]
                     if ma_cols:
+                        df_ma_sub = df_ma[["標準股票代碼", ma_cols[-1]]].rename(
+                            columns={ma_cols[-1]: "MA24均線"}
+                        )
                         merged_df = merged_df.merge(
-                            df_ma[["標準股票代碼", ma_cols[-1]]].rename(
-                                columns={ma_cols[-1]: "MA24均線"}
-                            ),
-                            on="標準股票代碼",
-                            how="left",
+                            df_ma_sub, on="標準股票代碼", how="left"
                         )
 
                 # 合併主力買超天數
-                if df_detail is not None and "標準股票代碼" in df_detail.columns:
+                if (
+                    df_detail is not None
+                    and "標準股票代碼" in df_detail.columns
+                    and not df_detail.empty
+                ):
                     buy_cols = [
                         c for c in df_detail.columns if "主力買超" in c
                     ]
                     if buy_cols:
+                        df_detail_sub = df_detail[
+                            ["標準股票代碼", buy_cols[0]]
+                        ].rename(columns={buy_cols[0]: "主力買超天數"})
                         merged_df = merged_df.merge(
-                            df_detail[
-                                ["標準股票代碼", buy_cols[0]]
-                            ].rename(columns={buy_cols[0]: "主力買超天數"}),
-                            on="標準股票代碼",
-                            how="left",
+                            df_detail_sub, on="標準股票代碼", how="left"
                         )
 
                 # 合併與上月高點距離
-                if df_high is not None and "標準股票代碼" in df_high.columns:
+                if (
+                    df_high is not None
+                    and "標準股票代碼" in df_high.columns
+                    and not df_high.empty
+                ):
                     dist_cols = [
                         c
                         for c in df_high.columns
                         if "距離" in c or "高點" in c
                     ]
                     if dist_cols:
+                        df_high_sub = df_high[
+                            ["標準股票代碼", dist_cols[0]]
+                        ].rename(columns={dist_cols[0]: "距離上月高點幅度"})
                         merged_df = merged_df.merge(
-                            df_high[
-                                ["標準股票代碼", dist_cols[0]]
-                            ].rename(
-                                columns={dist_cols[0]: "距離上月高點幅度"}
-                            ),
-                            on="標準股票代碼",
-                            how="left",
+                            df_high_sub, on="標準股票代碼", how="left"
                         )
 
                 # --- D. 條件過濾 ---
                 filtered_df = merged_df.copy()
+
+                # 顯示除錯資訊
+                st.info(
+                    f"📊 原始合併資料共 **{len(merged_df)}** 筆，開始執行條件篩選："
+                )
 
                 # 1. 基本面篩選 (YoY > 0, 毛利率季增, EPS > 0)
                 if use_fundamental:
@@ -287,22 +319,16 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                         None,
                     )
                     if close_col:
-                        filtered_df["MA24"] = pd.to_numeric(
+                        ma_num = pd.to_numeric(
                             filtered_df["MA24均線"], errors="coerce"
                         )
-                        filtered_df["Close"] = pd.to_numeric(
+                        close_num = pd.to_numeric(
                             filtered_df[close_col], errors="coerce"
                         )
 
                         filtered_df = filtered_df[
-                            (
-                                filtered_df["Close"]
-                                >= filtered_df["MA24"] * 0.95
-                            )
-                            & (
-                                filtered_df["Close"]
-                                <= filtered_df["MA24"] * 1.15
-                            )
+                            (close_num >= ma_num * 0.95)
+                            & (close_num <= ma_num * 1.15)
                         ]
 
                 # 3. 臨界點突破：距離上月高點介於 -3% ~ +3%
@@ -313,7 +339,7 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                     dist_num = pd.to_numeric(
                         filtered_df["距離上月高點幅度"], errors="coerce"
                     )
-                    # 自動相容 % 單位 (例如 3% 為 0.03 或 3)
+                    # 自動拆解是否包含 % 單位或小數表示
                     if dist_num.abs().max() > 1:
                         filtered_df = filtered_df[
                             (dist_num >= -3.0) & (dist_num <= 3.0)
@@ -325,12 +351,10 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
 
                 # 4. 主力買超天數 > 0
                 if use_main_buy and "主力買超天數" in filtered_df.columns:
-                    filtered_df = filtered_df[
-                        pd.to_numeric(
-                            filtered_df["主力買超天數"], errors="coerce"
-                        ).fillna(0)
-                        > 0
-                    ]
+                    buy_num = pd.to_numeric(
+                        filtered_df["主力買超天數"], errors="coerce"
+                    ).fillna(0)
+                    filtered_df = filtered_df[buy_num > 0]
 
                 # --- E. 營收分級與標記 ---
                 rev_yoy_col = next(
@@ -360,10 +384,10 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
 
                 # --- F. 結果呈現與匯出 ---
                 st.success(
-                    f"🎉 篩選完成！共找到 {len(filtered_df)} 檔符合策略的潛力個股"
+                    f"🎉 篩選完成！共找到 **{len(filtered_df)}** 檔符合條件的潛力個股"
                 )
 
-                # 調整顯示欄位順序
+                # 調整欄位順序
                 front_cols = [
                     "標準股票代碼",
                     "股票名稱",
@@ -378,15 +402,14 @@ if st.button("🚀 開始執行策略篩選", type="primary"):
                     for c in filtered_df.columns
                     if c not in existing_front
                     and not c.startswith("Unnamed")
-                    and c not in ["MA24", "Close"]
                 ]
 
                 result_df = filtered_df[existing_front + other_cols]
 
-                # 顯示表格
+                # 呈現表格
                 st.dataframe(result_df, use_container_width=True)
 
-                # 提供 Excel 下載
+                # 下載按鈕
                 buffer_out = io.BytesIO()
                 with pd.ExcelWriter(buffer_out, engine="openpyxl") as writer:
                     result_df.to_excel(writer, index=False, sheet_name="選股結果")
